@@ -1,6 +1,7 @@
-// Assuming you have already set up the AWS SDK and obtained valid credentials
 const AWS = require("aws-sdk");
-require('dotenv').config();
+const bunyan = require("bunyan");
+const fs = require("fs");
+require("dotenv").config();
 
 AWS.config.update({
   accessKeyId: process.env.ACCESS_KEY,
@@ -8,52 +9,72 @@ AWS.config.update({
 });
 
 const s3 = new AWS.S3();
-
 const bucketName = process.env.S3_BUCKET;
+const maxKeys = 1000; // Adjust as needed
+const markersFile = "./markers.json";
+
+// Initialize Bunyan logger
+const log = bunyan.createLogger({ name: "myapp" });
 
 async function deleteVersionedObjectsAndMarkers() {
-  try {
-    // List all object versions (including delete markers) in the bucket
-    const listParams = {
-      Bucket: bucketName,
-      MaxKeys: 5, // Adjust the value based on your bucket's object count
-    };
-    let response;
-    let counter = 0; // Counter to track the number of deleted objects and markers
+  let listParams = { Bucket: bucketName, MaxKeys: maxKeys };
 
-    do {
+  // Check if markers file exists and load it
+  if (fs.existsSync(markersFile)) {
+    const markers = JSON.parse(fs.readFileSync(markersFile, "utf8"));
+    listParams.KeyMarker = markers.NextKeyMarker;
+    listParams.VersionIdMarker = markers.NextVersionIdMarker;
+  }
+
+  let response;
+  let counter = 0; // Counter to track the number of deleted objects and markers
+
+  do {
+    try {
       response = await s3.listObjectVersions(listParams).promise();
+    } catch (error) {
+      log.error("Error listing object versions:", error);
+      continue;
+    }
 
-      // Delete objects and delete markers
+    const deletePromises = response.DeleteMarkers.map((marker) => {
       const deleteParams = {
         Bucket: bucketName,
         Delete: {
-          Objects: [],
+          Objects: [{ Key: marker.Key, VersionId: marker.VersionId }],
           Quiet: false,
         },
       };
 
-      response.DeleteMarkers.forEach((marker) => {
-        deleteParams.Delete.Objects.push({
-          Key: marker.Key,
-          VersionId: marker.VersionId,
-        });
-      });
+      return s3
+        .deleteObjects(deleteParams)
+        .promise()
+        .then(() => {
+          counter += 1;
+          log.info(
+            `Deleted object: ${marker.Key}, VersionId: ${marker.VersionId}. Total objects deleted so far: ${counter}`
+          );
+        })
+        .catch((error) => log.error("Error deleting object:", error));
+    });
 
-      // Perform the actual delete operation
-      if (deleteParams.Delete.Objects.length > 0) {
-        await s3.deleteObjects(deleteParams).promise();
-        counter += 1; // Update the counter with the number of deleted objects and markers
-        console.log("Total objects and markers deleted:", counter);
-      }
+    await Promise.all(deletePromises);
 
-      // Check if there are more objects to delete
-      listParams.KeyMarker = response.NextKeyMarker;
-      listParams.VersionIdMarker = response.NextVersionIdMarker;
-    } while (response.IsTruncated);
-  } catch (error) {
-    console.error("Error deleting versioned objects and markers:", error);
-  }
+    log.info("Batch completed. Total objects and markers deleted:", counter);
+
+    listParams.KeyMarker = response.NextKeyMarker;
+    listParams.VersionIdMarker = response.NextVersionIdMarker;
+
+    // Save the markers after each batch
+    fs.writeFileSync(
+      markersFile,
+      JSON.stringify({
+        NextKeyMarker: response.NextKeyMarker,
+        NextVersionIdMarker: response.NextVersionIdMarker,
+      }),
+      "utf8"
+    );
+  } while (response.IsTruncated);
 }
 
 // Call the function to initiate the deletion
